@@ -4,6 +4,7 @@
 #include <webgpu.h>
 
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -26,6 +27,7 @@ WGPUShaderModule createShaderModule(WGPUDevice device, std::filesystem::path con
 WGPURenderPipeline createPipeline(WGPUDevice device, WGPUShaderModule shaderModule,
                                   WGPUTextureFormat surfaceFormat) {
     WGPUPipelineLayoutDescriptor pipelineLayoutDescriptor = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    pipelineLayoutDescriptor.immediateSize = 128;
 
     WGPUPipelineLayout pipelineLayout = wgpuDeviceCreatePipelineLayout(device, &pipelineLayoutDescriptor);
 
@@ -60,6 +62,9 @@ int main() try {
 
     auto lastFrameStart = std::chrono::high_resolution_clock::now();
     float time = 0.f;
+    float posX = 0.f;
+    float posY = 0.f;
+    float const moveSpeed = 1.0f;
 
     std::unordered_set<SDL_Keycode> keydown;
 
@@ -93,6 +98,35 @@ int main() try {
         time += dt;
         lastFrameStart = now;
 
+        if (keydown.contains(SDLK_LEFT))
+            posX -= moveSpeed * dt;
+        if (keydown.contains(SDLK_RIGHT))
+            posX += moveSpeed * dt;
+        if (keydown.contains(SDLK_DOWN))
+            posY -= moveSpeed * dt;
+        if (keydown.contains(SDLK_UP))
+            posY += moveSpeed * dt;
+
+        float const scale = 0.5f;
+        float const angle = time;
+        float const c = std::cos(angle);
+        float const s = std::sin(angle);
+
+        float transform[16] = {
+            scale * c,  scale * s, 0.f, 0.f,
+           -scale * s,  scale * c, 0.f, 0.f,
+            0.f,        0.f,       1.f, 0.f,
+            posX,       posY,      0.f, 1.f,
+        };
+
+        float const aspect = float(app.width()) / float(app.height());
+        float view[16] = {
+            1.f / aspect, 0.f, 0.f, 0.f,
+            0.f,          1.f, 0.f, 0.f,
+            0.f,          0.f, 1.f, 0.f,
+            0.f,          0.f, 0.f, 1.f,
+        };
+
         WGPUTextureView targetView = wgpuTextureCreateView(surfaceTexture->texture, nullptr);
 
         WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(app.device(), nullptr);
@@ -109,7 +143,9 @@ int main() try {
         WGPURenderPassEncoder renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDescriptor);
 
         wgpuRenderPassEncoderSetPipeline(renderPass, renderPipeline);
-        wgpuRenderPassEncoderDraw(renderPass, 3, 1, 0, 0);
+        wgpuRenderPassEncoderSetImmediates(renderPass, 0, transform, sizeof(transform));
+        wgpuRenderPassEncoderSetImmediates(renderPass, 64, view, sizeof(view));
+        wgpuRenderPassEncoderDraw(renderPass, 18, 1, 0, 0);
         wgpuRenderPassEncoderEnd(renderPass);
         wgpuRenderPassEncoderRelease(renderPass);
 

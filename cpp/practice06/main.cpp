@@ -5,7 +5,10 @@
 
 #include <webgpu.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -109,7 +112,11 @@ WGPURenderPipeline createMainPipeline(WGPUDevice device, WGPUShaderModule shader
 struct TextureImmediates {
     math::vector2f center;
     math::vector2f extent;
+    std::int32_t mode;
+    float time;
 };
+
+static_assert(sizeof(TextureImmediates) == 24);
 
 WGPURenderPipeline createTexturePipeline(WGPUDevice device, WGPUShaderModule shaderModule, WGPUTextureFormat surfaceFormat, WGPUBindGroupLayout textureBindGroupLayout) {
     WGPUPipelineLayoutDescriptor pipelineLayoutDescriptor = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
@@ -142,13 +149,29 @@ WGPURenderPipeline createTexturePipeline(WGPUDevice device, WGPUShaderModule sha
     return renderPipeline;
 }
 
+WGPUBindGroup createLayerBindGroup(WGPUDevice device, WGPUBindGroupLayout layout,
+                                   WGPUTextureView textureView, WGPUSampler sampler) {
+    WGPUBindGroupEntry entries[2] = {WGPU_BIND_GROUP_ENTRY_INIT, WGPU_BIND_GROUP_ENTRY_INIT};
+    entries[0].binding = 0;
+    entries[0].textureView = textureView;
+    entries[1].binding = 1;
+    entries[1].sampler = sampler;
+
+    WGPUBindGroupDescriptor descriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    descriptor.layout = layout;
+    descriptor.entryCount = 2;
+    descriptor.entries = entries;
+    return wgpuDeviceCreateBindGroup(device, &descriptor);
+}
+
 int main() try {
     WgpuApp app("Practice06", 1280, 720, false);
 
     WGPUBindGroupLayout textureBindGroupLayout = createTextureBindGroupLayout(app.device());
 
     WGPUShaderModule mainShaderModule = createShaderModule(app.device(), projectRoot / "shader_main.wgsl");
-    WGPURenderPipeline mainRenderPipeline = createMainPipeline(app.device(), mainShaderModule, app.surfaceFormat());
+    WGPURenderPipeline mainRenderPipeline =
+        createMainPipeline(app.device(), mainShaderModule, WGPUTextureFormat_RGBA8Unorm);
 
     WGPUShaderModule textureShaderModule = createShaderModule(app.device(), projectRoot / "shader_texture.wgsl");
     WGPURenderPipeline textureRenderPipeline = createTexturePipeline(app.device(), textureShaderModule, app.surfaceFormat(), textureBindGroupLayout);
@@ -158,8 +181,40 @@ int main() try {
     auto vertexBuffer = loadBuffer(app.device(), app.queue(), dragon.vertices, WGPUBufferUsage_Vertex);
     auto indexBuffer = loadBuffer(app.device(), app.queue(), dragon.indices, WGPUBufferUsage_Index);
 
+    WGPUSamplerDescriptor samplerDescriptor = WGPU_SAMPLER_DESCRIPTOR_INIT;
+    samplerDescriptor.addressModeU = WGPUAddressMode_ClampToEdge;
+    samplerDescriptor.addressModeV = WGPUAddressMode_ClampToEdge;
+    samplerDescriptor.addressModeW = WGPUAddressMode_ClampToEdge;
+    samplerDescriptor.magFilter = WGPUFilterMode_Linear;
+    samplerDescriptor.minFilter = WGPUFilterMode_Linear;
+    samplerDescriptor.mipmapFilter = WGPUMipmapFilterMode_Linear;
+    WGPUSampler sampler = wgpuDeviceCreateSampler(app.device(), &samplerDescriptor);
+
     WGPUTexture depthBuffer = nullptr;
     WGPUTextureView depthBufferView = nullptr;
+
+    WGPUTexture offscreenTexture = nullptr;
+    std::array<WGPUTextureView, 4> offscreenViews{};
+    std::array<WGPUBindGroup, 4> offscreenBindGroups{};
+
+    auto releaseOffscreen = [&]() {
+        for (auto & bg : offscreenBindGroups) {
+            if (bg) {
+                wgpuBindGroupRelease(bg);
+                bg = nullptr;
+            }
+        }
+        for (auto & view : offscreenViews) {
+            if (view) {
+                wgpuTextureViewRelease(view);
+                view = nullptr;
+            }
+        }
+        if (offscreenTexture) {
+            wgpuTextureRelease(offscreenTexture);
+            offscreenTexture = nullptr;
+        }
+    };
 
     auto lastFrameStart = std::chrono::high_resolution_clock::now();
     float time = 0.f;
@@ -194,14 +249,44 @@ int main() try {
             continue;
         }
 
-        if (!depthBuffer || wgpuTextureGetWidth(depthBuffer) != app.width() || wgpuTextureGetHeight(depthBuffer) != app.height()) {
+        std::uint32_t const offW = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(app.width()) / 2);
+        std::uint32_t const offH = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(app.height()) / 2);
+
+        bool const needResize = !offscreenTexture
+            || wgpuTextureGetWidth(offscreenTexture) != offW
+            || wgpuTextureGetHeight(offscreenTexture) != offH;
+
+        if (needResize) {
+            releaseOffscreen();
             if (depthBufferView) wgpuTextureViewRelease(depthBufferView);
             if (depthBuffer) wgpuTextureRelease(depthBuffer);
+
+            WGPUTextureDescriptor offscreenDescriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
+            offscreenDescriptor.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+            offscreenDescriptor.dimension = WGPUTextureDimension_2D;
+            offscreenDescriptor.size = {offW, offH, 4};
+            offscreenDescriptor.format = WGPUTextureFormat_RGBA8Unorm;
+            offscreenTexture = wgpuDeviceCreateTexture(app.device(), &offscreenDescriptor);
+
+            for (std::uint32_t k = 0; k < 4; ++k) {
+                WGPUTextureViewDescriptor viewDescriptor = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+                viewDescriptor.format = WGPUTextureFormat_RGBA8Unorm;
+                viewDescriptor.dimension = WGPUTextureViewDimension_2D;
+                viewDescriptor.baseMipLevel = 0;
+                viewDescriptor.mipLevelCount = 1;
+                viewDescriptor.baseArrayLayer = k;
+                viewDescriptor.arrayLayerCount = 1;
+                viewDescriptor.aspect = WGPUTextureAspect_All;
+                viewDescriptor.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+                offscreenViews[k] = wgpuTextureCreateView(offscreenTexture, &viewDescriptor);
+                offscreenBindGroups[k] = createLayerBindGroup(app.device(), textureBindGroupLayout,
+                                                              offscreenViews[k], sampler);
+            }
 
             WGPUTextureDescriptor depthBufferDescriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
             depthBufferDescriptor.usage = WGPUTextureUsage_RenderAttachment;
             depthBufferDescriptor.dimension = WGPUTextureDimension_2D;
-            depthBufferDescriptor.size = {(std::uint32_t)app.width(), (std::uint32_t)app.height(), 1};
+            depthBufferDescriptor.size = {offW, offH, 1};
             depthBufferDescriptor.format = WGPUTextureFormat_Depth24Plus;
             depthBuffer = wgpuDeviceCreateTexture(app.device(), &depthBufferDescriptor);
 
@@ -226,44 +311,102 @@ int main() try {
         if (keydown.contains(SDLK_DOWN)) camera_distance -= 3.f * dt;
 
         math::matrix4f const model = math::rotation_xz(model_rotation) * math::scale(math::vector{2.f, 2.f, 2.f});
-        math::matrix4f const view = math::translation(math::vector{0.f, 0.f, - camera_distance});
-        math::matrix4f const projection = math::perspective(std::numbers::pi_v<float> / 3.f, app.width() * 1.f / app.height(), 0.01f, 100.f);
-
         auto const modelTranspose = math::transpose(model);
-        auto const viewProjectionTranspose = math::transpose(projection * view);
+
+        float const aspect = float(offW) / float(offH);
+        float const ortho = 0.75f * camera_distance;
+        math::matrix4f const orthoProj =
+            math::orthographic(-ortho * aspect, ortho * aspect, -ortho, ortho, 0.01f, 100.f)
+            * math::scale(math::vector{1.f, 1.f, -1.f});
+        math::matrix4f const viewFront = math::translation(math::vector{0.f, 0.f, -camera_distance});
+
+        std::array<math::matrix4f, 4> viewProjections{
+            math::perspective(std::numbers::pi_v<float> / 3.f, aspect, 0.01f, 100.f) * viewFront,
+            orthoProj * viewFront,
+            orthoProj * viewFront * math::rotation_xz(std::numbers::pi_v<float> * 0.5f),
+            orthoProj * viewFront * math::rotation_yz(std::numbers::pi_v<float> * 0.5f),
+        };
+
+        std::array<WGPUColor, 4> clearColors{
+            WGPUColor{0.00, 0.06, 0.10, 1.0},
+            WGPUColor{0.12, 0.02, 0.02, 1.0},
+            WGPUColor{0.02, 0.10, 0.04, 1.0},
+            WGPUColor{0.08, 0.04, 0.12, 1.0},
+        };
 
         WGPUTextureView targetView = wgpuTextureCreateView(surfaceTexture->texture, nullptr);
 
         WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(app.device(), nullptr);
 
-        WGPURenderPassColorAttachment colorAttachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
-        colorAttachment.view = targetView;
-        colorAttachment.loadOp = WGPULoadOp_Clear;
-        colorAttachment.storeOp = WGPUStoreOp_Store;
-        colorAttachment.clearValue = {0.00, 0.06, 0.10, 1.0};
+        for (std::uint32_t k = 0; k < 4; ++k) {
+            WGPURenderPassColorAttachment colorAttachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            colorAttachment.view = offscreenViews[k];
+            colorAttachment.loadOp = WGPULoadOp_Clear;
+            colorAttachment.storeOp = WGPUStoreOp_Store;
+            colorAttachment.clearValue = clearColors[k];
 
-        WGPURenderPassDepthStencilAttachment depthStencilAttachment = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
-        depthStencilAttachment.view = depthBufferView;
-        depthStencilAttachment.depthLoadOp = WGPULoadOp_Clear;
-        depthStencilAttachment.depthStoreOp = WGPUStoreOp_Discard;
-        depthStencilAttachment.depthClearValue = 1.f;
-        depthStencilAttachment.depthReadOnly = WGPU_FALSE;
+            WGPURenderPassDepthStencilAttachment depthStencilAttachment = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+            depthStencilAttachment.view = depthBufferView;
+            depthStencilAttachment.depthLoadOp = WGPULoadOp_Clear;
+            depthStencilAttachment.depthStoreOp = WGPUStoreOp_Discard;
+            depthStencilAttachment.depthClearValue = 1.f;
+            depthStencilAttachment.depthReadOnly = WGPU_FALSE;
 
-        WGPURenderPassDescriptor renderPassDescriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-        renderPassDescriptor.colorAttachmentCount = 1;
-        renderPassDescriptor.colorAttachments = &colorAttachment;
-        renderPassDescriptor.depthStencilAttachment = &depthStencilAttachment;
-        WGPURenderPassEncoder renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDescriptor);
+            WGPURenderPassDescriptor renderPassDescriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            renderPassDescriptor.colorAttachmentCount = 1;
+            renderPassDescriptor.colorAttachments = &colorAttachment;
+            renderPassDescriptor.depthStencilAttachment = &depthStencilAttachment;
+            WGPURenderPassEncoder renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDescriptor);
 
-        wgpuRenderPassEncoderSetPipeline(renderPass, mainRenderPipeline);
-        wgpuRenderPassEncoderSetVertexBuffer(renderPass, 0, vertexBuffer, 0, WGPU_WHOLE_SIZE);
-        wgpuRenderPassEncoderSetIndexBuffer(renderPass, indexBuffer, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-        wgpuRenderPassEncoderSetImmediates(renderPass, 0, &modelTranspose, sizeof(modelTranspose));
-        wgpuRenderPassEncoderSetImmediates(renderPass, 64, &viewProjectionTranspose, sizeof(viewProjectionTranspose));
-        wgpuRenderPassEncoderDrawIndexed(renderPass, dragon.indices.size(), 1, 0, 0, 0);
+            auto const viewProjectionTranspose = math::transpose(viewProjections[k]);
 
-        wgpuRenderPassEncoderEnd(renderPass);
-        wgpuRenderPassEncoderRelease(renderPass);
+            wgpuRenderPassEncoderSetPipeline(renderPass, mainRenderPipeline);
+            wgpuRenderPassEncoderSetVertexBuffer(renderPass, 0, vertexBuffer, 0, WGPU_WHOLE_SIZE);
+            wgpuRenderPassEncoderSetIndexBuffer(renderPass, indexBuffer, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+            wgpuRenderPassEncoderSetImmediates(renderPass, 0, &modelTranspose, sizeof(modelTranspose));
+            wgpuRenderPassEncoderSetImmediates(renderPass, 64, &viewProjectionTranspose, sizeof(viewProjectionTranspose));
+            wgpuRenderPassEncoderDrawIndexed(renderPass, dragon.indices.size(), 1, 0, 0, 0);
+
+            wgpuRenderPassEncoderEnd(renderPass);
+            wgpuRenderPassEncoderRelease(renderPass);
+        }
+
+        {
+            WGPURenderPassColorAttachment colorAttachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+            colorAttachment.view = targetView;
+            colorAttachment.loadOp = WGPULoadOp_Clear;
+            colorAttachment.storeOp = WGPUStoreOp_Store;
+            colorAttachment.clearValue = {0.0, 0.0, 0.0, 1.0};
+
+            WGPURenderPassDescriptor renderPassDescriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            renderPassDescriptor.colorAttachmentCount = 1;
+            renderPassDescriptor.colorAttachments = &colorAttachment;
+            WGPURenderPassEncoder renderPass = wgpuCommandEncoderBeginRenderPass(encoder, &renderPassDescriptor);
+
+            wgpuRenderPassEncoderSetPipeline(renderPass, textureRenderPipeline);
+
+            std::array<math::vector2f, 4> centers{
+                math::vector2f{-0.5f, -0.5f},
+                math::vector2f{ 0.5f, -0.5f},
+                math::vector2f{-0.5f,  0.5f},
+                math::vector2f{ 0.5f,  0.5f},
+            };
+
+            for (std::int32_t k = 0; k < 4; ++k) {
+                TextureImmediates immediates{
+                    .center = centers[k],
+                    .extent = math::vector2f{0.5f, 0.5f},
+                    .mode = k,
+                    .time = time,
+                };
+                wgpuRenderPassEncoderSetBindGroup(renderPass, 0, offscreenBindGroups[k], 0, nullptr);
+                wgpuRenderPassEncoderSetImmediates(renderPass, 0, &immediates, sizeof(immediates));
+                wgpuRenderPassEncoderDraw(renderPass, 6, 1, 0, 0);
+            }
+
+            wgpuRenderPassEncoderEnd(renderPass);
+            wgpuRenderPassEncoderRelease(renderPass);
+        }
 
         WGPUCommandBuffer commandBuffer = wgpuCommandEncoderFinish(encoder, nullptr);
         wgpuCommandEncoderRelease(encoder);
@@ -277,9 +420,11 @@ int main() try {
         wgpuTextureRelease(surfaceTexture->texture);
     }
 
+    releaseOffscreen();
     if (depthBufferView) wgpuTextureViewRelease(depthBufferView);
     if (depthBuffer) wgpuTextureRelease(depthBuffer);
 
+    wgpuSamplerRelease(sampler);
     wgpuBufferRelease(vertexBuffer);
     wgpuBufferRelease(indexBuffer);
 

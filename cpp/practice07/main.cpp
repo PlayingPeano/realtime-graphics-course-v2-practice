@@ -7,6 +7,8 @@
 #include <webgpu.h>
 
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -25,18 +27,45 @@ struct CameraUniforms
 struct LightsUniforms
 {
     math::vector3f ambientIntensity;
-    float padding = 0.f;
+    float pad0 = 0.f;
+    math::vector3f directionalDirection;
+    float pad1 = 0.f;
+    math::vector3f directionalIntensity;
+    float pad2 = 0.f;
+    math::vector3f pointPosition;
+    float pad3 = 0.f;
+    math::vector3f pointIntensity;
+    float pad4 = 0.f;
+    math::vector3f pointAttenuation;
+    float pad5 = 0.f;
 };
+
+static_assert(sizeof(LightsUniforms) == 96);
+static_assert(offsetof(LightsUniforms, directionalDirection) == 16);
+static_assert(offsetof(LightsUniforms, pointPosition) == 48);
+static_assert(offsetof(LightsUniforms, pointAttenuation) == 80);
 
 struct Immediates
 {
     math::matrix4f modelTranspose;
+    math::vector3f albedo;
+    float roughness;
+    float specularFactor;
+    float pad[3]{};
 };
+
+static_assert(sizeof(Immediates) == 96);
+static_assert(offsetof(Immediates, albedo) == 64);
+static_assert(offsetof(Immediates, roughness) == 76);
+static_assert(offsetof(Immediates, specularFactor) == 80);
 
 struct LightImmediates
 {
     math::vector3f position;
+    float padding = 0.f;
 };
+
+static_assert(sizeof(LightImmediates) == 16);
 
 WGPUShaderModule createShaderModule(WGPUDevice device, std::filesystem::path const & path) {
     auto const source = loadFile(path);
@@ -220,7 +249,7 @@ int main() try {
     auto lastFrameStart = std::chrono::high_resolution_clock::now();
     float time = 0.f;
 
-    float camera_distance = 5.f;
+    float camera_distance = 8.f;
     float camera_rotation = 0.f;
 
     bool paused = false;
@@ -285,7 +314,6 @@ int main() try {
         if (keydown.contains(SDLK_UP)) camera_distance += 7.f * dt;
         if (keydown.contains(SDLK_DOWN)) camera_distance -= 7.f * dt;
 
-        math::matrix4f const model = math::matrix4f::identity();
         math::matrix4f const view = math::translation(math::vector{0.f, 0.f, - camera_distance})
             * math::rotation_xz(camera_rotation);
         math::matrix4f const projection = math::perspective(std::numbers::pi_v<float> / 3.f, app.width() * 1.f / app.height(), 0.01f, 100.f);
@@ -297,8 +325,24 @@ int main() try {
 
         wgpuQueueWriteBuffer(app.queue(), cameraUniformBuffer, 0, &cameraUniforms, sizeof(cameraUniforms));
 
+        math::vector3f const directionalDirection = math::normalized(math::vector{
+            0.4f * std::sin(time * 0.5f),
+            0.8f,
+            0.7f,
+        });
+        math::vector3f const pointPosition{
+            2.3f * std::sin(time * 0.7f),
+            2.3f * std::cos(time * 0.7f),
+            1.6f,
+        };
+
         LightsUniforms const lightUniforms {
-            .ambientIntensity = {0.01f, 0.01f, 0.01f},
+            .ambientIntensity = {0.02f, 0.02f, 0.025f},
+            .directionalDirection = directionalDirection,
+            .directionalIntensity = {0.9f, 0.85f, 0.75f},
+            .pointPosition = pointPosition,
+            .pointIntensity = {0.3f, 8.f, 0.4f},
+            .pointAttenuation = {1.f, 0.f, 0.1f},
         };
 
         wgpuQueueWriteBuffer(app.queue(), lightsUniformBuffer, 0, &lightUniforms, sizeof(lightUniforms));
@@ -311,7 +355,6 @@ int main() try {
         colorAttachment.view = targetView;
         colorAttachment.loadOp = WGPULoadOp_Clear;
         colorAttachment.storeOp = WGPUStoreOp_Store;
-        colorAttachment.clearValue = {0.5, 0.7, 1.0, 1.0};
         colorAttachment.clearValue = {0.01, 0.03, 0.05, 1.0};
 
         WGPURenderPassDepthStencilAttachment depthStencilAttachment = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
@@ -330,14 +373,38 @@ int main() try {
         wgpuRenderPassEncoderSetPipeline(renderPass, renderPipeline);
         wgpuRenderPassEncoderSetBindGroup(renderPass, 0, cameraBindGroup, 0, nullptr);
         wgpuRenderPassEncoderSetBindGroup(renderPass, 1, lightsBindGroup, 0, nullptr);
-
-        Immediates const immediates {
-            .modelTranspose = math::transpose(model),
-        };
-        wgpuRenderPassEncoderSetImmediates(renderPass, 0, &immediates, sizeof(immediates));
         wgpuRenderPassEncoderSetVertexBuffer(renderPass, 0, vertexBuffer, 0, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderSetIndexBuffer(renderPass, indexBuffer, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
-        wgpuRenderPassEncoderDrawIndexed(renderPass, suzanne.indices.size(), 1, 0, 0, 0);
+
+        math::vector3f const albedo{0.92f, 0.70f, 0.50f};
+        float const spacingX = 3.2f;
+        float const spacingY = 2.5f;
+        for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 3; ++col) {
+                float const x = (static_cast<float>(col) - 1.f) * spacingX;
+                float const y = (1.f - static_cast<float>(row)) * spacingY;
+                math::matrix4f const model = math::translation(math::vector{x, y, 0.f});
+                float const roughness = row == 0 ? 0.05f : (row == 1 ? 0.25f : 0.7f);
+                float const specularFactor = 0.5f * static_cast<float>(col);
+
+                Immediates const immediates {
+                    .modelTranspose = math::transpose(model),
+                    .albedo = albedo,
+                    .roughness = roughness,
+                    .specularFactor = specularFactor,
+                };
+                wgpuRenderPassEncoderSetImmediates(renderPass, 0, &immediates, sizeof(immediates));
+                wgpuRenderPassEncoderDrawIndexed(renderPass, suzanne.indices.size(), 1, 0, 0, 0);
+            }
+        }
+
+        wgpuRenderPassEncoderSetPipeline(renderPass, lightRenderPipeline);
+        wgpuRenderPassEncoderSetBindGroup(renderPass, 0, cameraBindGroup, 0, nullptr);
+        LightImmediates const lightImmediates {
+            .position = pointPosition,
+        };
+        wgpuRenderPassEncoderSetImmediates(renderPass, 0, &lightImmediates, sizeof(lightImmediates));
+        wgpuRenderPassEncoderDraw(renderPass, 6, 1, 0, 0);
 
         wgpuRenderPassEncoderEnd(renderPass);
         wgpuRenderPassEncoderRelease(renderPass);
@@ -360,8 +427,16 @@ int main() try {
     wgpuBufferRelease(vertexBuffer);
     wgpuBufferRelease(indexBuffer);
 
+    wgpuRenderPipelineRelease(lightRenderPipeline);
+    wgpuShaderModuleRelease(lightShaderModule);
     wgpuRenderPipelineRelease(renderPipeline);
     wgpuShaderModuleRelease(shaderModule);
+    wgpuBindGroupRelease(cameraBindGroup);
+    wgpuBindGroupRelease(lightsBindGroup);
+    wgpuBindGroupLayoutRelease(cameraBindGroupLayout);
+    wgpuBindGroupLayoutRelease(lightsBindGroupLayout);
+    wgpuBufferRelease(cameraUniformBuffer);
+    wgpuBufferRelease(lightsUniformBuffer);
 } catch (const std::exception &e) {
     std::cerr << "error: " << e.what() << std::endl;
     return EXIT_FAILURE;

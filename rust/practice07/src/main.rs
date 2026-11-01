@@ -267,10 +267,10 @@ impl WgpuApp for Practice07 {
             cache: None,
         });
 
-        let cow = load_obj(Path::new(PROJECT_ROOT).join("suzanne.obj")).unwrap();
+        let suzanne = load_obj(Path::new(PROJECT_ROOT).join("suzanne.obj")).unwrap();
 
-        let vertex_buffer = load_buffer(&app.device, &cow.vertices, wgpu::BufferUsages::VERTEX);
-        let index_buffer = load_buffer(&app.device, &cow.indices, wgpu::BufferUsages::INDEX);
+        let vertex_buffer = load_buffer(&app.device, &suzanne.vertices, wgpu::BufferUsages::VERTEX);
+        let index_buffer = load_buffer(&app.device, &suzanne.indices, wgpu::BufferUsages::INDEX);
 
         Self {
             depth_buffer: None,
@@ -283,7 +283,7 @@ impl WgpuApp for Practice07 {
             light_pipeline,
             vertex_buffer,
             index_buffer,
-            index_count: cow.indices.len() as u32,
+            index_count: suzanne.indices.len() as u32,
             last_frame_start: Instant::now(),
             time: 0.0,
             camera_distance: 5.0,

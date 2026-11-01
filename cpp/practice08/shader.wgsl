@@ -19,6 +19,7 @@ struct LightsUniforms {
     ambientIntensity: vec3f,
     lightDirection: vec3f,
     lightIntensity: vec3f,
+    shadowProjection: mat4x4f,
 }
 
 struct Immediates {
@@ -30,6 +31,8 @@ struct Immediates {
 
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(1) @binding(0) var<uniform> lights: LightsUniforms;
+@group(1) @binding(1) var shadowMap: texture_depth_2d;
+@group(1) @binding(3) var shadowCompareSampler: sampler_comparison;
 
 var<immediate> immediates: Immediates;
 
@@ -44,6 +47,21 @@ fn vertexMain(in: VertexIn) -> VertexOut {
 }
 
 const PI = 3.1415926535;
+const SHADOW_BIAS = 0.005;
+const PCF_WEIGHTS = array<f32, 7>(0.006, 0.061, 0.242, 0.383, 0.242, 0.061, 0.006);
+
+fn pcfVisibility(uv: vec2f, depth: f32) -> f32 {
+    let texel = 1.0 / vec2f(textureDimensions(shadowMap));
+    var sum = 0.0;
+    for (var j = 0; j < 7; j++) {
+        for (var i = 0; i < 7; i++) {
+            let offset = vec2f(f32(i) - 3.0, f32(j) - 3.0) * texel;
+            sum += PCF_WEIGHTS[i] * PCF_WEIGHTS[j]
+                * textureSampleCompareLevel(shadowMap, shadowCompareSampler, uv + offset, depth);
+        }
+    }
+    return sum;
+}
 
 fn computeLight(normal: vec3f, lightDirection: vec3f, lightIntensity: vec3f, viewDirection: vec3f) -> vec3f {
     let halfway = normalize(lightDirection + viewDirection);
@@ -60,8 +78,16 @@ fn fragmentMain(in: VertexOut) -> @location(0) vec4f {
     let specularPower = 1.0 / max(0.0001, immediates.roughness * immediates.roughness) - 1.0;
     let cosine = max(0.0, dot(normal, lights.lightDirection));
 
-    let color = immediates.albedo * (lights.ambientIntensity + lights.lightIntensity * cosine)
+    var shadowClip = lights.shadowProjection * vec4f(in.world_position, 1.0);
+    let shadowNdc = shadowClip.xyz / shadowClip.w;
+    let shadowUv = vec2f(0.5) + shadowNdc.xy * vec2f(0.5, -0.5);
+    let compared = pcfVisibility(shadowUv, shadowNdc.z - SHADOW_BIAS);
+    let inside = all(abs(shadowNdc.xy) < vec2f(1.0)) && shadowNdc.z >= 0.0 && shadowNdc.z <= 1.0;
+    let visibility = select(1.0, compared, inside);
+
+    let direct = immediates.albedo * lights.lightIntensity * cosine
         + lights.lightIntensity * immediates.specularFactor * (specularPower + 2.0) / (2.0 * PI) * pow(max(0.0, dot(halfway, normal)), specularPower);
+    let color = immediates.albedo * lights.ambientIntensity + visibility * direct;
 
     return vec4f(color, 1.0);
 }

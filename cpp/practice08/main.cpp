@@ -7,6 +7,7 @@
 #include <webgpu.h>
 
 #include <chrono>
+#include <cstddef>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -30,7 +31,18 @@ struct LightsUniforms
     float padding2 = 0.f;
     math::vector3f lightIntensity;
     float padding3 = 0.f;
+    math::matrix4f shadowProjectionTranspose;
 };
+
+static_assert(sizeof(LightsUniforms) == 112);
+static_assert(offsetof(LightsUniforms, shadowProjectionTranspose) == 48);
+
+struct ShadowImmediates
+{
+    math::matrix4f shadowProjectionTranspose;
+};
+
+static_assert(sizeof(ShadowImmediates) == 64);
 
 struct Immediates
 {
@@ -86,10 +98,25 @@ WGPUBindGroupLayout createCameraBindGroupLayout(WGPUDevice device) {
 }
 
 WGPUBindGroupLayout createLightsBindGroupLayout(WGPUDevice device) {
-    WGPUBindGroupLayoutEntry layoutEntries[1] = {WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT};
+    WGPUBindGroupLayoutEntry layoutEntries[4] = {
+        WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+        WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+        WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+        WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT,
+    };
     layoutEntries[0].binding = 0;
     layoutEntries[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
     layoutEntries[0].buffer.type = WGPUBufferBindingType_Uniform;
+    layoutEntries[1].binding = 1;
+    layoutEntries[1].visibility = WGPUShaderStage_Fragment;
+    layoutEntries[1].texture.sampleType = WGPUTextureSampleType_Depth;
+    layoutEntries[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+    layoutEntries[2].binding = 2;
+    layoutEntries[2].visibility = WGPUShaderStage_Fragment;
+    layoutEntries[2].sampler.type = WGPUSamplerBindingType_Filtering;
+    layoutEntries[3].binding = 3;
+    layoutEntries[3].visibility = WGPUShaderStage_Fragment;
+    layoutEntries[3].sampler.type = WGPUSamplerBindingType_Comparison;
 
     WGPUBindGroupLayoutDescriptor bindGroupLayoutDescriptor = WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
     bindGroupLayoutDescriptor.entries = layoutEntries;
@@ -112,11 +139,23 @@ WGPUBindGroup createCameraBindGroup(WGPUDevice device, WGPUBindGroupLayout bindG
     return wgpuDeviceCreateBindGroup(device, &bindGroupDescriptor);
 }
 
-WGPUBindGroup createLightsBindGroup(WGPUDevice device, WGPUBindGroupLayout bindGroupLayout, WGPUBuffer uniformBuffer) {
-    WGPUBindGroupEntry entries[1] = {WGPU_BIND_GROUP_ENTRY_INIT};
+WGPUBindGroup createLightsBindGroup(WGPUDevice device, WGPUBindGroupLayout bindGroupLayout, WGPUBuffer uniformBuffer,
+        WGPUTextureView shadowMapView, WGPUSampler shadowSampler, WGPUSampler shadowCompareSampler) {
+    WGPUBindGroupEntry entries[4] = {
+        WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT,
+    };
     entries[0].binding = 0;
     entries[0].buffer = uniformBuffer;
     entries[0].size = WGPU_WHOLE_SIZE;
+    entries[1].binding = 1;
+    entries[1].textureView = shadowMapView;
+    entries[2].binding = 2;
+    entries[2].sampler = shadowSampler;
+    entries[3].binding = 3;
+    entries[3].sampler = shadowCompareSampler;
 
     WGPUBindGroupDescriptor bindGroupDescriptor = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     bindGroupDescriptor.layout = bindGroupLayout;
@@ -231,6 +270,44 @@ WGPURenderPipeline createDebugDepthTexturePipeline(WGPUDevice device, WGPUShader
     return renderPipeline;
 }
 
+WGPURenderPipeline createShadowPipeline(WGPUDevice device, WGPUShaderModule shaderModule) {
+    WGPUPipelineLayoutDescriptor pipelineLayoutDescriptor = WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    pipelineLayoutDescriptor.immediateSize = sizeof(ShadowImmediates);
+
+    WGPUPipelineLayout pipelineLayout = wgpuDeviceCreatePipelineLayout(device, &pipelineLayoutDescriptor);
+
+    WGPUVertexAttribute attributes[1] = {WGPU_VERTEX_ATTRIBUTE_INIT};
+    attributes[0].offset = 0;
+    attributes[0].shaderLocation = 0;
+    attributes[0].format = WGPUVertexFormat_Float32x3;
+
+    WGPUVertexBufferLayout vertexBufferLayout = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+    vertexBufferLayout.arrayStride = sizeof(ObjVertex);
+    vertexBufferLayout.attributeCount = 1;
+    vertexBufferLayout.attributes = attributes;
+    vertexBufferLayout.stepMode = WGPUVertexStepMode_Vertex;
+
+    WGPUDepthStencilState depthStencilState = WGPU_DEPTH_STENCIL_STATE_INIT;
+    depthStencilState.format = WGPUTextureFormat_Depth24Plus;
+    depthStencilState.depthWriteEnabled = WGPUOptionalBool_True;
+    depthStencilState.depthCompare = WGPUCompareFunction_Less;
+
+    WGPURenderPipelineDescriptor renderPipelineDescriptor = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    renderPipelineDescriptor.layout = pipelineLayout;
+    renderPipelineDescriptor.vertex.module = shaderModule;
+    renderPipelineDescriptor.vertex.entryPoint = {"vertexMain", WGPU_STRLEN};
+    renderPipelineDescriptor.vertex.buffers = &vertexBufferLayout;
+    renderPipelineDescriptor.vertex.bufferCount = 1;
+    renderPipelineDescriptor.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    renderPipelineDescriptor.primitive.cullMode = WGPUCullMode_None;
+    renderPipelineDescriptor.depthStencil = &depthStencilState;
+
+    WGPURenderPipeline renderPipeline = wgpuDeviceCreateRenderPipeline(device, &renderPipelineDescriptor);
+    wgpuPipelineLayoutRelease(pipelineLayout);
+
+    return renderPipeline;
+}
+
 int main() try {
     WgpuApp app("Practice08", 1280, 720, true);
 
@@ -239,14 +316,53 @@ int main() try {
 
     WGPUShaderModule shaderModule = createShaderModule(app.device(), projectRoot / "shader.wgsl");
     WGPUShaderModule debugDepthTextureShaderModule = createShaderModule(app.device(), projectRoot / "debug_depth_texture_shader.wgsl");
+    WGPUShaderModule shadowShaderModule = createShaderModule(app.device(), projectRoot / "shader_shadow.wgsl");
 
     WGPURenderPipeline renderPipeline = createPipeline(app.device(), shaderModule, app.surfaceFormat(), cameraBindGroupLayout, lightsBindGroupLayout);
     WGPURenderPipeline debugDepthTextureRenderPipeline = createDebugDepthTexturePipeline(app.device(), debugDepthTextureShaderModule, app.surfaceFormat(), lightsBindGroupLayout);
+    WGPURenderPipeline shadowRenderPipeline = createShadowPipeline(app.device(), shadowShaderModule);
+
+    std::uint32_t const shadowMapSize = 1024;
+    WGPUTextureDescriptor shadowMapDescriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    shadowMapDescriptor.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    shadowMapDescriptor.dimension = WGPUTextureDimension_2D;
+    shadowMapDescriptor.size = {shadowMapSize, shadowMapSize, 1};
+    shadowMapDescriptor.format = WGPUTextureFormat_Depth24Plus;
+    WGPUTexture shadowMap = wgpuDeviceCreateTexture(app.device(), &shadowMapDescriptor);
+
+    WGPUTextureViewDescriptor shadowMapViewDescriptor = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+    shadowMapViewDescriptor.format = WGPUTextureFormat_Depth24Plus;
+    shadowMapViewDescriptor.dimension = WGPUTextureViewDimension_2D;
+    shadowMapViewDescriptor.mipLevelCount = 1;
+    shadowMapViewDescriptor.arrayLayerCount = 1;
+    shadowMapViewDescriptor.aspect = WGPUTextureAspect_DepthOnly;
+    shadowMapViewDescriptor.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding;
+    WGPUTextureView shadowMapView = wgpuTextureCreateView(shadowMap, &shadowMapViewDescriptor);
+
+    WGPUSamplerDescriptor shadowSamplerDescriptor = WGPU_SAMPLER_DESCRIPTOR_INIT;
+    shadowSamplerDescriptor.addressModeU = WGPUAddressMode_ClampToEdge;
+    shadowSamplerDescriptor.addressModeV = WGPUAddressMode_ClampToEdge;
+    shadowSamplerDescriptor.addressModeW = WGPUAddressMode_ClampToEdge;
+    shadowSamplerDescriptor.magFilter = WGPUFilterMode_Nearest;
+    shadowSamplerDescriptor.minFilter = WGPUFilterMode_Nearest;
+    shadowSamplerDescriptor.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+    WGPUSampler shadowSampler = wgpuDeviceCreateSampler(app.device(), &shadowSamplerDescriptor);
+
+    WGPUSamplerDescriptor shadowCompareSamplerDescriptor = WGPU_SAMPLER_DESCRIPTOR_INIT;
+    shadowCompareSamplerDescriptor.addressModeU = WGPUAddressMode_ClampToEdge;
+    shadowCompareSamplerDescriptor.addressModeV = WGPUAddressMode_ClampToEdge;
+    shadowCompareSamplerDescriptor.addressModeW = WGPUAddressMode_ClampToEdge;
+    shadowCompareSamplerDescriptor.magFilter = WGPUFilterMode_Linear;
+    shadowCompareSamplerDescriptor.minFilter = WGPUFilterMode_Linear;
+    shadowCompareSamplerDescriptor.mipmapFilter = WGPUMipmapFilterMode_Nearest;
+    shadowCompareSamplerDescriptor.compare = WGPUCompareFunction_Less;
+    WGPUSampler shadowCompareSampler = wgpuDeviceCreateSampler(app.device(), &shadowCompareSamplerDescriptor);
 
     WGPUBuffer cameraUniformBuffer = createBuffer(app.device(), sizeof(CameraUniforms), WGPUBufferUsage_Uniform);
     WGPUBuffer lightsUniformBuffer = createBuffer(app.device(), sizeof(LightsUniforms), WGPUBufferUsage_Uniform);
     WGPUBindGroup cameraBindGroup = createCameraBindGroup(app.device(), cameraBindGroupLayout, cameraUniformBuffer);
-    WGPUBindGroup lightsBindGroup = createLightsBindGroup(app.device(), lightsBindGroupLayout, lightsUniformBuffer);
+    WGPUBindGroup lightsBindGroup = createLightsBindGroup(app.device(), lightsBindGroupLayout, lightsUniformBuffer,
+        shadowMapView, shadowSampler, shadowCompareSampler);
 
     ObjMesh buddha = loadObj(projectRoot / "buddha.obj");
 
@@ -334,6 +450,24 @@ int main() try {
 
         math::vector3f const lightDirection = math::normalized(math::vector{std::cos(time * 0.5f), 1.f, std::sin(time * 0.5f)});
 
+        math::vector3f const shadowZ = -lightDirection;
+        math::vector3f shadowX = math::cross(math::vector{0.f, 1.f, 0.f}, shadowZ);
+        if (math::length_squared(shadowX) < 1e-8f)
+            shadowX = math::cross(math::vector{1.f, 0.f, 0.f}, shadowZ);
+        shadowX = math::normalized(shadowX);
+        math::vector3f const shadowY = math::cross(shadowZ, shadowX);
+
+        math::matrix4f shadowView = math::matrix4f::identity();
+        for (int component = 0; component < 3; ++component) {
+            shadowView[0][component] = shadowX[component];
+            shadowView[1][component] = shadowY[component];
+            shadowView[2][component] = shadowZ[component];
+        }
+        math::matrix4f zRemap = math::matrix4f::identity();
+        zRemap[2][2] = 0.5f;
+        zRemap[2][3] = 0.5f;
+        math::matrix4f const shadowProjectionTranspose = math::transpose(zRemap * shadowView);
+
         CameraUniforms const cameraUniforms {
             .viewProjectionTranspose = math::transpose(projection * view),
             .position = math::head<3>(math::inverse(view).value() * math::vector{0.f, 0.f, 0.f, 1.f}),
@@ -345,6 +479,7 @@ int main() try {
             .ambientIntensity = {0.05f, 0.10f, 0.15f},
             .lightDirection = lightDirection,
             .lightIntensity = {0.8f, 0.6f, 0.4f},
+            .shadowProjectionTranspose = shadowProjectionTranspose,
         };
 
         wgpuQueueWriteBuffer(app.queue(), lightsUniformBuffer, 0, &lightsUniforms, sizeof(lightsUniforms));
@@ -352,6 +487,33 @@ int main() try {
         WGPUTextureView targetView = wgpuTextureCreateView(surfaceTexture->texture, nullptr);
 
         WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(app.device(), nullptr);
+
+        {
+            WGPURenderPassDepthStencilAttachment shadowDepthAttachment = WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+            shadowDepthAttachment.view = shadowMapView;
+            shadowDepthAttachment.depthLoadOp = WGPULoadOp_Clear;
+            shadowDepthAttachment.depthStoreOp = WGPUStoreOp_Store;
+            shadowDepthAttachment.depthClearValue = 1.f;
+            shadowDepthAttachment.depthReadOnly = WGPU_FALSE;
+
+            WGPURenderPassDescriptor shadowPassDescriptor = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+            shadowPassDescriptor.colorAttachmentCount = 0;
+            shadowPassDescriptor.depthStencilAttachment = &shadowDepthAttachment;
+            WGPURenderPassEncoder shadowPass = wgpuCommandEncoderBeginRenderPass(encoder, &shadowPassDescriptor);
+
+            ShadowImmediates const shadowImmediates {
+                .shadowProjectionTranspose = shadowProjectionTranspose,
+            };
+            wgpuRenderPassEncoderSetPipeline(shadowPass, shadowRenderPipeline);
+            wgpuRenderPassEncoderSetViewport(shadowPass, 0.f, 0.f, float(shadowMapSize), float(shadowMapSize), 0.f, 1.f);
+            wgpuRenderPassEncoderSetImmediates(shadowPass, 0, &shadowImmediates, sizeof(shadowImmediates));
+            wgpuRenderPassEncoderSetVertexBuffer(shadowPass, 0, vertexBuffer, 0, WGPU_WHOLE_SIZE);
+            wgpuRenderPassEncoderSetIndexBuffer(shadowPass, indexBuffer, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
+            wgpuRenderPassEncoderDrawIndexed(shadowPass, buddha.indices.size(), 1, 0, 0, 0);
+
+            wgpuRenderPassEncoderEnd(shadowPass);
+            wgpuRenderPassEncoderRelease(shadowPass);
+        }
 
         WGPURenderPassColorAttachment colorAttachment = WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
         colorAttachment.view = targetView;
@@ -387,6 +549,18 @@ int main() try {
         wgpuRenderPassEncoderSetIndexBuffer(renderPass, indexBuffer, WGPUIndexFormat_Uint32, 0, WGPU_WHOLE_SIZE);
         wgpuRenderPassEncoderDrawIndexed(renderPass, buddha.indices.size(), 1, 0, 0, 0);
 
+        float const debugSide = 0.32f * static_cast<float>(app.height());
+        float const debugExtentX = debugSide / static_cast<float>(app.width());
+        float const debugExtentY = debugSide / static_cast<float>(app.height());
+        DebugDepthTextureImmediates const debugImmediates {
+            .center = {-1.f + debugExtentX, -1.f + debugExtentY},
+            .extent = {debugExtentX, debugExtentY},
+        };
+        wgpuRenderPassEncoderSetPipeline(renderPass, debugDepthTextureRenderPipeline);
+        wgpuRenderPassEncoderSetBindGroup(renderPass, 0, lightsBindGroup, 0, nullptr);
+        wgpuRenderPassEncoderSetImmediates(renderPass, 0, &debugImmediates, sizeof(debugImmediates));
+        wgpuRenderPassEncoderDraw(renderPass, 6, 1, 0, 0);
+
         wgpuRenderPassEncoderEnd(renderPass);
         wgpuRenderPassEncoderRelease(renderPass);
 
@@ -408,8 +582,22 @@ int main() try {
     wgpuBufferRelease(vertexBuffer);
     wgpuBufferRelease(indexBuffer);
 
+    wgpuRenderPipelineRelease(shadowRenderPipeline);
+    wgpuShaderModuleRelease(shadowShaderModule);
+    wgpuRenderPipelineRelease(debugDepthTextureRenderPipeline);
+    wgpuShaderModuleRelease(debugDepthTextureShaderModule);
     wgpuRenderPipelineRelease(renderPipeline);
     wgpuShaderModuleRelease(shaderModule);
+    wgpuBindGroupRelease(cameraBindGroup);
+    wgpuBindGroupRelease(lightsBindGroup);
+    wgpuBindGroupLayoutRelease(cameraBindGroupLayout);
+    wgpuBindGroupLayoutRelease(lightsBindGroupLayout);
+    wgpuBufferRelease(cameraUniformBuffer);
+    wgpuBufferRelease(lightsUniformBuffer);
+    wgpuSamplerRelease(shadowSampler);
+    wgpuSamplerRelease(shadowCompareSampler);
+    wgpuTextureViewRelease(shadowMapView);
+    wgpuTextureRelease(shadowMap);
 } catch (const std::exception &e) {
     std::cerr << "error: " << e.what() << std::endl;
     return EXIT_FAILURE;

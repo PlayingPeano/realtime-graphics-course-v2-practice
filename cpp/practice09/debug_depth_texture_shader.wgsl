@@ -1,5 +1,5 @@
-@group(0) @binding(1) var shadowMap: texture_depth_2d;
 @group(0) @binding(2) var shadowMapSampler: sampler;
+@group(0) @binding(3) var shadowMoments: texture_2d<f32>;
 
 struct VertexOut {
 	@builtin(position) clip_position: vec4f,
@@ -33,5 +33,6 @@ fn vertexMain(@builtin(vertex_index) vertex_id: u32) -> VertexOut {
 
 @fragment
 fn fragmentMain(in: VertexOut) -> @location(0) vec4f {
-	return vec4f(textureSample(shadowMap, shadowMapSampler, in.texcoord));
+    let moments = textureSample(shadowMoments, shadowMapSampler, in.texcoord);
+    return vec4f(moments.xy, 0.0, 1.0);
 }

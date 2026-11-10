@@ -3,7 +3,7 @@ use std::mem;
 use std::path::Path;
 use std::time::Instant;
 use std::f32::consts::PI;
-use glam::{Vec3, Mat4};
+use glam::{Vec3, Vec4, Mat4};
 use wgpu::util::DeviceExt;
 
 use wgpu_app::{run, load_obj, ObjVertex, AppConfig, WgpuApp, WgpuState, KeyCode};
@@ -350,7 +350,7 @@ impl WgpuApp for Practice07 {
 
         let camera_uniforms = CameraUniforms {
             view_projection: projection_matrix * view_matrix,
-            position: Vec3::new(0.0, 0.0, 0.0),
+            position: (view_matrix.inverse() * Vec4::new(0.0, 0.0, 0.0, 1.0)).truncate(),
             padding: 0.0,
         };
 

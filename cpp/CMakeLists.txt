@@ -19,4 +19,6 @@ add_subdirectory(practice05)
 add_subdirectory(practice06)
 add_subdirectory(practice07)
 add_subdirectory(practice08)
+add_subdirectory(practice09)
+add_subdirectory(practice10)
 
